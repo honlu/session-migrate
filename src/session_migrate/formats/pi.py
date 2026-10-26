@@ -3,6 +3,10 @@
 The writer targets the documented ``@earendil-works/pi-coding-agent`` session
 format.  Pi accepts an explicit session file through ``--session``; no database
 mutation or private API is required.
+
+The reader additionally accepts the message roles Pi >= 1.x emits (``system``
+harness preambles and user-run ``bashExecution`` commands) so newer Pi
+sessions migrate without manual sanitization.
 """
 
 from __future__ import annotations
@@ -499,10 +503,10 @@ def _validate_message(value: Any) -> None:
     if not isinstance(value, dict):
         raise SessionMigrateError("Pi message entry is missing its message")
     role = string(value.get("role"))
-    if role not in {"user", "assistant", "toolResult"}:
+    if role not in {"user", "assistant", "toolResult", "system", "bashExecution"}:
         raise SessionMigrateError("Pi message entry has an unsupported role")
     content = value.get("content")
-    if not isinstance(content, (str, list)):
+    if role not in {"system", "bashExecution"} and not isinstance(content, (str, list)):
         raise SessionMigrateError("Pi message entry has invalid content")
     if role == "toolResult" and not string(value.get("toolCallId")):
         raise SessionMigrateError("Pi tool result is missing its call ID")
@@ -627,6 +631,39 @@ def _entry_events(
                 _opaque_pi_event(entry, record_index, f"{reason_prefix}_tool_result_details")
             )
         return result
+    if role_name == "system":
+        # Pi >= 1.x stores the harness preamble (prompt sections) as a leading
+        # system message. It is privileged runtime context, not user history,
+        # so it projects as a system event and targets that refuse privileged
+        # roles drop it deliberately.
+        text = _system_message_text(message)
+        if not text:
+            return []
+        return [
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.SYSTEM,
+                text=text,
+                timestamp=timestamp,
+                provenance=provenance,
+            )
+        ]
+    if role_name == "bashExecution":
+        # Pi >= 1.x records commands the user ran from the pi prompt (for
+        # example an editor launch) as bashExecution messages. Project them as
+        # user messages so the command history survives migration.
+        text = _bash_execution_text(message)
+        if not text:
+            return []
+        return [
+            Event(
+                kind=EventKind.MESSAGE,
+                role=Role.USER,
+                text=text,
+                timestamp=timestamp,
+                provenance=provenance,
+            )
+        ]
     reason = (
         f"{reason_prefix}_bash_execution_message"
         if role_name == "bashExecution"
@@ -635,6 +672,32 @@ def _entry_events(
         else f"unknown_{reason_prefix}_message_role"
     )
     return [_opaque_pi_event(entry, record_index, reason)]
+
+
+def _system_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        return content
+    sections = message.get("sections")
+    if isinstance(sections, dict):
+        parts = [str(value) for value in sections.values() if isinstance(value, str) and value]
+        return "\n\n".join(parts)
+    return ""
+
+
+def _bash_execution_text(message: dict[str, Any]) -> str:
+    command = string(message.get("command"))
+    output = string(message.get("output"))
+    parts: list[str] = []
+    if command:
+        exit_code = message.get("exitCode")
+        header = f"[bash] {command}"
+        if isinstance(exit_code, int):
+            header = f"{header} (exit {exit_code})"
+        parts.append(header)
+    if output:
+        parts.append(output)
+    return "\n".join(parts)
 
 
 def _content_events(
